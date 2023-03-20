@@ -27,7 +27,7 @@ go install github.com/go-delve/delve/cmd/dlv@latest
 cd kubernetes/cmd/kubectl
 ```
 构建
-```go
+```shell
 go build -gcflags="all=-N -l" -o kubectl
 ```
 启动
@@ -46,5 +46,7 @@ dlv exec ./kubectl --listen=:2345 --headless=true --api-version=2 -- get pod
 即可调试远程主机进程了，当然记得打断点哦
 ## 参考
 [源码讲解](https://developer.ibm.com/articles/a-tour-of-the-kubernetes-source-code/)
+
 [源码目录介绍](https://arunprasad86.medium.com/want-to-understand-kubernetes-source-code-this-is-how-you-can-start-exploring-6eea25e50a69)
+
 [使用Gland调试kubernetes](https://xmudrii.com/posts/debugging-kubernetes/)
