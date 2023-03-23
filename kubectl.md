@@ -468,8 +468,370 @@ func (c *Command) execute(a []string) (err error) {
 	return nil
 }
 ```
-以kubectl get pods命令，再看下具体get命令的执行
+## 3.get命令执行
+以kubectl get pods命令为例，再看下具体get命令的执行
 ```go
+// NewCmdGet 创建get命令
+func NewCmdGet(parent string, f cmdutil.Factory, streams genericclioptions.IOStreams) *cobra.Command {
+	o := NewGetOptions(parent, streams)
 
+	cmd := &cobra.Command{
+		Use:                   fmt.Sprintf("get [(-o|--output=)%s] (TYPE[.VERSION][.GROUP] [NAME | -l label] | TYPE[.VERSION][.GROUP]/NAME ...) [flags]", strings.Join(o.PrintFlags.AllowedFormats(), "|")),
+		DisableFlagsInUseLine: true,
+		Short:                 i18n.T("Display one or many resources"),
+		Long:                  getLong + "\n\n" + cmdutil.SuggestAPIResources(parent),
+		Example:               getExample,
+		// ValidArgsFunction is set when this function is called so that we have access to the util package
+		Run: func(cmd *cobra.Command, args []string) {
+			cmdutil.CheckErr(o.Complete(f, cmd, args))
+			cmdutil.CheckErr(o.Validate())
+			cmdutil.CheckErr(o.Run(f, args)) // 执行命令在这里
+		},
+		SuggestFor: []string{"list", "ps"},
+	}
+
+	o.PrintFlags.AddFlags(cmd)
+
+	cmd.Flags().StringVar(&o.Raw, "raw", o.Raw, "Raw URI to request from the server.  Uses the transport specified by the kubeconfig file.")
+	cmd.Flags().BoolVarP(&o.Watch, "watch", "w", o.Watch, "After listing/getting the requested object, watch for changes.")
+	cmd.Flags().BoolVar(&o.WatchOnly, "watch-only", o.WatchOnly, "Watch for changes to the requested object(s), without listing/getting first.")
+	cmd.Flags().BoolVar(&o.OutputWatchEvents, "output-watch-events", o.OutputWatchEvents, "Output watch event objects when --watch or --watch-only is used. Existing objects are output as initial ADDED events.")
+	cmd.Flags().BoolVar(&o.IgnoreNotFound, "ignore-not-found", o.IgnoreNotFound, "If the requested object does not exist the command will return exit code 0.")
+	cmd.Flags().StringVar(&o.FieldSelector, "field-selector", o.FieldSelector, "Selector (field query) to filter on, supports '=', '==', and '!='.(e.g. --field-selector key1=value1,key2=value2). The server only supports a limited number of field queries per type.")
+	cmd.Flags().BoolVarP(&o.AllNamespaces, "all-namespaces", "A", o.AllNamespaces, "If present, list the requested object(s) across all namespaces. Namespace in current context is ignored even if specified with --namespace.")
+	addServerPrintColumnFlags(cmd, o)
+	cmdutil.AddFilenameOptionFlags(cmd, &o.FilenameOptions, "identifying the resource to get from a server.")
+	cmdutil.AddChunkSizeFlag(cmd, &o.ChunkSize)
+	cmdutil.AddLabelSelectorFlagVar(cmd, &o.LabelSelector)
+	cmdutil.AddSubresourceFlags(cmd, &o.Subresource, "If specified, gets the subresource of the requested object.", supportedSubresources...)
+	return cmd
+}
 ```
-## 3.子命令
+```go
+func (o *GetOptions) Run(f cmdutil.Factory, args []string) error {
+	if len(o.Raw) > 0 {
+		restClient, err := f.RESTClient()
+		if err != nil {
+			return err
+		}
+		return rawhttp.RawGet(restClient, o.IOStreams, o.Raw)
+	}
+	if o.Watch || o.WatchOnly {
+		return o.watch(f, args)
+	}
+
+	chunkSize := o.ChunkSize
+	if len(o.SortBy) > 0 {
+		// TODO(juanvallejo): in the future, we could have the client use chunking
+		// to gather all results, then sort them all at the end to reduce server load.
+		chunkSize = 0
+	}
+    // 建造者模式，设置各个部分，Do返回一个被装饰的访问者（装饰器模式、访问者模式）
+	r := f.NewBuilder().
+		Unstructured().
+		NamespaceParam(o.Namespace).DefaultNamespace().AllNamespaces(o.AllNamespaces).
+		FilenameParam(o.ExplicitNamespace, &o.FilenameOptions).
+		LabelSelectorParam(o.LabelSelector).
+		FieldSelectorParam(o.FieldSelector).
+		Subresource(o.Subresource).
+		RequestChunksOf(chunkSize).
+		ResourceTypeOrNameArgs(true, args...).
+		ContinueOnError().
+		Latest().
+		Flatten().
+		TransformRequests(o.transformRequests).
+		Do()
+
+	if o.IgnoreNotFound {
+		r.IgnoreErrors(apierrors.IsNotFound)
+	}
+	if err := r.Err(); err != nil {
+		return err
+	}
+
+	if !o.IsHumanReadablePrinter {
+		return o.printGeneric(r)
+	}
+
+	allErrs := []error{}
+	errs := sets.NewString()
+	// Infos里调用所有访问者
+	infos, err := r.Infos()
+	if err != nil {
+		allErrs = append(allErrs, err)
+	}
+	printWithKind := multipleGVKsRequested(infos)
+
+	objs := make([]runtime.Object, len(infos))
+	for ix := range infos {
+		objs[ix] = infos[ix].Object
+	}
+
+	var positioner OriginalPositioner
+	if len(o.SortBy) > 0 {
+		sorter := NewRuntimeSorter(objs, o.SortBy)
+		if err := sorter.Sort(); err != nil {
+			return err
+		}
+		positioner = sorter
+	}
+
+	var printer printers.ResourcePrinter
+	var lastMapping *meta.RESTMapping
+
+	// track if we write any output
+	trackingWriter := &trackingWriterWrapper{Delegate: o.Out}
+	// output an empty line separating output
+	separatorWriter := &separatorWriterWrapper{Delegate: trackingWriter}
+
+	w := printers.GetNewTabWriter(separatorWriter)
+	allResourcesNamespaced := !o.AllNamespaces
+	for ix := range objs {
+		var mapping *meta.RESTMapping
+		var info *resource.Info
+		if positioner != nil {
+			info = infos[positioner.OriginalPosition(ix)]
+			mapping = info.Mapping
+		} else {
+			info = infos[ix]
+			mapping = info.Mapping
+		}
+
+		allResourcesNamespaced = allResourcesNamespaced && info.Namespaced()
+		printWithNamespace := o.AllNamespaces
+
+		if mapping != nil && mapping.Scope.Name() == meta.RESTScopeNameRoot {
+			printWithNamespace = false
+		}
+
+		if shouldGetNewPrinterForMapping(printer, lastMapping, mapping) {
+			w.Flush()
+			w.SetRememberedWidths(nil)
+
+			// add linebreaks between resource groups (if there is more than one)
+			// when it satisfies all following 3 conditions:
+			// 1) it's not the first resource group
+			// 2) it has row header
+			// 3) we've written output since the last time we started a new set of headers
+			if lastMapping != nil && !o.NoHeaders && trackingWriter.Written > 0 {
+				separatorWriter.SetReady(true)
+			}
+
+			printer, err = o.ToPrinter(mapping, nil, printWithNamespace, printWithKind)
+			if err != nil {
+				if !errs.Has(err.Error()) {
+					errs.Insert(err.Error())
+					allErrs = append(allErrs, err)
+				}
+				continue
+			}
+
+			lastMapping = mapping
+		}
+
+		printer.PrintObj(info.Object, w)
+	}
+	w.Flush()
+	if trackingWriter.Written == 0 && !o.IgnoreNotFound && len(allErrs) == 0 {
+		// if we wrote no output, and had no errors, and are not ignoring NotFound, be sure we output something
+		if allResourcesNamespaced {
+			fmt.Fprintf(o.ErrOut, "No resources found in %s namespace.\n", o.Namespace)
+		} else {
+			fmt.Fprintln(o.ErrOut, "No resources found")
+		}
+	}
+	return utilerrors.NewAggregate(allErrs)
+}
+```
+```go
+func (r *Result) Infos() ([]*Info, error) {
+	if r.err != nil {
+		return nil, r.err
+	}
+	if r.info != nil {
+		return r.info, nil
+	}
+
+	infos := []*Info{}
+	// r.visitor首先是个被装饰器装饰的访问者，会遍历所有的visitor
+	err := r.visitor.Visit(func(info *Info, err error) error {
+		if err != nil {
+			return err
+		}
+		infos = append(infos, info)
+		return nil
+	})
+	err = utilerrors.FilterOut(err, r.ignoreErrors...)
+
+	r.info, r.err = infos, err
+	return infos, err
+}
+```
+```go
+func (b *Builder) Do() *Result {
+	// 返回一个包含访问者的结果，这里会包含selector等visitor
+	r := b.visitorResult()
+	r.mapper = b.Mapper()
+	if r.err != nil {
+		return r
+	}
+	if b.flatten {
+		r.visitor = NewFlattenListVisitor(r.visitor, b.objectTyper, b.mapper)
+	}
+	helpers := []VisitorFunc{}
+	if b.defaultNamespace {
+		helpers = append(helpers, SetNamespace(b.namespace))
+	}
+	if b.requireNamespace {
+		helpers = append(helpers, RequireNamespace(b.namespace))
+	}
+	helpers = append(helpers, FilterNamespace)
+	if b.requireObject {
+		helpers = append(helpers, RetrieveLazy)
+	}
+	if b.continueOnError {
+		r.visitor = ContinueOnErrorVisitor{Visitor: r.visitor}
+	}
+	// 返回一个被装饰器装饰的访问者
+	r.visitor = NewDecoratedVisitor(r.visitor, helpers...)
+	return r
+}
+```
+```go
+func (b *Builder) visitorResult() *Result {
+	if len(b.errs) > 0 {
+		return &Result{err: utilerrors.NewAggregate(b.errs)}
+	}
+
+	if b.selectAll {
+		selector := labels.Everything().String()
+		b.labelSelector = &selector
+	}
+
+	// visit items specified by paths
+	if len(b.paths) != 0 {
+		return b.visitByPaths()
+	}
+
+	// 用selectors访问
+	if b.labelSelector != nil || b.fieldSelector != nil {
+		return b.visitBySelector()
+	}
+
+	// visit items specified by resource and name
+	if len(b.resourceTuples) != 0 {
+		return b.visitByResource()
+	}
+
+	// visit items specified by name
+	if len(b.names) != 0 {
+		return b.visitByName()
+	}
+
+	if len(b.resources) != 0 {
+		for _, r := range b.resources {
+			_, err := b.mappingFor(r)
+			if err != nil {
+				return &Result{err: err}
+			}
+		}
+		return &Result{err: fmt.Errorf("resource(s) were provided, but no name was specified")}
+	}
+	return &Result{err: missingResourceError}
+}
+```
+```go
+func (b *Builder) visitBySelector() *Result {
+	result := &Result{
+		targetsSingleItems: false,
+	}
+
+	if len(b.names) != 0 {
+		return result.withError(fmt.Errorf("name cannot be provided when a selector is specified"))
+	}
+	if len(b.resourceTuples) != 0 {
+		return result.withError(fmt.Errorf("selectors and the all flag cannot be used when passing resource/name arguments"))
+	}
+	if len(b.resources) == 0 {
+		return result.withError(fmt.Errorf("at least one resource must be specified to use a selector"))
+	}
+	if len(b.subresource) != 0 {
+		return result.withError(fmt.Errorf("subresource cannot be used when bulk resources are specified"))
+	}
+
+	mappings, err := b.resourceMappings()
+	if err != nil {
+		result.err = err
+		return result
+	}
+
+	var labelSelector, fieldSelector string
+	if b.labelSelector != nil {
+		labelSelector = *b.labelSelector
+	}
+	if b.fieldSelector != nil {
+		fieldSelector = *b.fieldSelector
+	}
+
+	visitors := []Visitor{}
+	for _, mapping := range mappings {
+		client, err := b.getClient(mapping.GroupVersionKind.GroupVersion())
+		if err != nil {
+			result.err = err
+			return result
+		}
+		selectorNamespace := b.namespace
+		if mapping.Scope.Name() != meta.RESTScopeNameNamespace {
+			selectorNamespace = ""
+		}
+		// NewSelector返回的Selector访问会发起restful请求
+		visitors = append(visitors, NewSelector(client, mapping, selectorNamespace, labelSelector, fieldSelector, b.limitChunks))
+	}
+	if b.continueOnError {
+		result.visitor = EagerVisitorList(visitors)
+	} else {
+		result.visitor = VisitorList(visitors)
+	}
+	result.sources = visitors
+	return result
+}
+```
+```go
+// Visit implements Visitor and uses request chunking by default.
+func (r *Selector) Visit(fn VisitorFunc) error {
+	helper := NewHelper(r.Client, r.Mapping)
+	initialOpts := metav1.ListOptions{
+		LabelSelector: r.LabelSelector,
+		FieldSelector: r.FieldSelector,
+		Limit:         r.LimitChunks,
+	}
+	return FollowContinue(&initialOpts, func(options metav1.ListOptions) (runtime.Object, error) {
+        // 使用RESTClient发起Get请求
+		list, err := helper.List(
+			r.Namespace,
+			r.ResourceMapping().GroupVersionKind.GroupVersion().String(),
+			&options,
+		)
+		if err != nil {
+			return nil, EnhanceListError(err, options, r.Mapping.Resource.String())
+		}
+		resourceVersion, _ := metadataAccessor.ResourceVersion(list)
+
+		info := &Info{
+			Client:  r.Client,
+			Mapping: r.Mapping,
+
+			Namespace:       r.Namespace,
+			ResourceVersion: resourceVersion,
+
+			Object: list,
+		}
+
+		if err := fn(info, nil); err != nil {
+			return nil, err
+		}
+		return list, nil
+	})
+}
+```
+## 4.添加子命令
