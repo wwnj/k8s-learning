@@ -834,6 +834,5 @@ func (r *Selector) Visit(fn VisitorFunc) error {
 	})
 }
 ```
-## 4.添加子命令
-## 5.参考
+## 4.参考
 [皓叔的k8s visitor模式](https://coolshell.cn/articles/21263.html)
