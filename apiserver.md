@@ -7,6 +7,7 @@ command := app.NewAPIServerCommand()
 code := cli.Run(command)
 os.Exit(code)
 ```
+cobra.Command运行会执行RunE函数，详情可见kubectl命令分析
 ```go
 func NewAPIServerCommand() *cobra.Command {
 	s := options.NewServerRunOptions()
@@ -25,7 +26,7 @@ cluster's shared state through which all other components interact.`,
 			rest.SetDefaultWarningHandler(rest.NoWarnings{})
 			return nil
 		},
-		// 命令运行
+		// 命令运行，最后会调用这个函数
 		RunE: func(cmd *cobra.Command, args []string) error {
 			verflag.PrintAndExitIfRequested()
 			fs := cmd.Flags()
