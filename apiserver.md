@@ -2,7 +2,20 @@
 ## 1.简介
 Kubernetes API 服务器负责为集群管理API服务，是各个组件之间沟通的桥梁，外部都通过该服务器与集群进行交互。
 ## 2.初始化
-## 2.创建apiserver
+kubernetes/pkg/api/legacyscheme/scheme.go定义变量并初始化
+```go
+var (
+	// Kubernetes API已注册的Scheme
+	Scheme = runtime.NewScheme()
+
+	// Scheme的编解码器
+	Codecs = serializer.NewCodecFactory(Scheme)
+
+	// ParameterCodec将Objects的版本转换为查询参数
+	ParameterCodec = runtime.NewParameterCodec(Scheme)
+)
+```
+## 3.创建apiserver
 ```go
 command := app.NewAPIServerCommand()
 code := cli.Run(command)
