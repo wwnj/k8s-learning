@@ -15,6 +15,134 @@ var (
 	ParameterCodec = runtime.NewParameterCodec(Scheme)
 )
 ```
+注册Scheme
+```go
+kubernetes/cmd/kube-apiserver/apiserver.go引入
+    k8s.io/kubernetes/cmd/kube-apiserver/app
+kubernetes/cmd/kube-apiserver/app/server.go引入
+    k8s.io/kubernetes/pkg/controlplane
+kubernetes/pkg/controlplane/import_known_versions.go引入
+    _ "k8s.io/kubernetes/pkg/apis/admission/install"
+    _ "k8s.io/kubernetes/pkg/apis/admissionregistration/install"
+    _ "k8s.io/kubernetes/pkg/apis/apiserverinternal/install"
+    _ "k8s.io/kubernetes/pkg/apis/apps/install"
+    _ "k8s.io/kubernetes/pkg/apis/authentication/install"
+    _ "k8s.io/kubernetes/pkg/apis/authorization/install"
+    _ "k8s.io/kubernetes/pkg/apis/autoscaling/install"
+    _ "k8s.io/kubernetes/pkg/apis/batch/install"
+    _ "k8s.io/kubernetes/pkg/apis/certificates/install"
+    _ "k8s.io/kubernetes/pkg/apis/coordination/install"
+    _ "k8s.io/kubernetes/pkg/apis/core/install"
+    _ "k8s.io/kubernetes/pkg/apis/discovery/install"
+    _ "k8s.io/kubernetes/pkg/apis/events/install"
+    _ "k8s.io/kubernetes/pkg/apis/extensions/install"
+    _ "k8s.io/kubernetes/pkg/apis/flowcontrol/install"
+    _ "k8s.io/kubernetes/pkg/apis/imagepolicy/install"
+    _ "k8s.io/kubernetes/pkg/apis/networking/install"
+    _ "k8s.io/kubernetes/pkg/apis/node/install"
+    _ "k8s.io/kubernetes/pkg/apis/policy/install"
+    _ "k8s.io/kubernetes/pkg/apis/rbac/install"
+    _ "k8s.io/kubernetes/pkg/apis/resource/install"
+    _ "k8s.io/kubernetes/pkg/apis/scheduling/install"
+    _ "k8s.io/kubernetes/pkg/apis/storage/install"
+```
+以k8s.io/kubernetes/pkg/apis/core/install/install.go为例
+```go
+func init() {
+	Install(legacyscheme.Scheme)
+}
+
+// Install registers the API group and adds types to a scheme
+func Install(scheme *runtime.Scheme) {
+	utilruntime.Must(core.AddToScheme(scheme))
+	utilruntime.Must(v1.AddToScheme(scheme))
+	utilruntime.Must(scheme.SetVersionPriority(v1.SchemeGroupVersion))
+}
+```
+以utilruntime.Must(core.AddToScheme(scheme))为例
+```go
+var (
+	// SchemeBuilder 注册多种已知类型
+	SchemeBuilder = runtime.NewSchemeBuilder(addKnownTypes)
+
+	// AddToScheme represents a func that can be used to apply all the registered
+	// funcs in a scheme
+	AddToScheme = SchemeBuilder.AddToScheme
+)
+```
+```go
+func addKnownTypes(scheme *runtime.Scheme) error {
+    if err := scheme.AddIgnoredConversionType(&metav1.TypeMeta{}, &metav1.TypeMeta{}); err != nil {
+        return err
+    }
+	// 注册已知类型
+    scheme.AddKnownTypes(SchemeGroupVersion,
+        &Pod{},
+        &PodList{},
+        &PodStatusResult{},
+        &PodTemplate{},
+        &PodTemplateList{},
+        &ReplicationControllerList{},
+        &ReplicationController{},
+        &ServiceList{},
+        &Service{},
+        &ServiceProxyOptions{},
+        &NodeList{},
+        &Node{},
+        &NodeProxyOptions{},
+        &Endpoints{},
+        &EndpointsList{},
+        &Binding{},
+        &Event{},
+        &EventList{},
+        &List{},
+        &LimitRange{},
+        &LimitRangeList{},
+        &ResourceQuota{},
+        &ResourceQuotaList{},
+        &Namespace{},
+        &NamespaceList{},
+        &ServiceAccount{},
+        &ServiceAccountList{},
+        &Secret{},
+        &SecretList{},
+        &PersistentVolume{},
+        &PersistentVolumeList{},
+        &PersistentVolumeClaim{},
+        &PersistentVolumeClaimList{},
+        &PodAttachOptions{},
+        &PodLogOptions{},
+        &PodExecOptions{},
+        &PodPortForwardOptions{},
+        &PodProxyOptions{},
+        &ComponentStatus{},
+        &ComponentStatusList{},
+        &SerializedReference{},
+        &RangeAllocation{},
+        &ConfigMap{},
+        &ConfigMapList{},
+    )
+    
+    return nil
+}
+
+// NewSchemeBuilder calls Register for you.
+func NewSchemeBuilder(funcs ...func(*Scheme) error) SchemeBuilder {
+    var sb SchemeBuilder
+    sb.Register(funcs...)
+    return sb
+}
+
+func (sb *SchemeBuilder) AddToScheme(s *Scheme) error {
+	for _, f := range *sb {
+		if err := f(s); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+```
+其他instatll也类似；至此，多种类型已注册到Scheme中
 ## 3.创建apiserver
 ```go
 command := app.NewAPIServerCommand()
