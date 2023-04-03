@@ -242,12 +242,13 @@ func Run(completeOptions completedServerRunOptions, stopCh <-chan struct{}) erro
 ```
 ```go
 func CreateServerChain(completedOptions completedServerRunOptions) (*aggregatorapiserver.APIAggregator, error) {
+	// 创建kube-apiserver配置
 	kubeAPIServerConfig, serviceResolver, pluginInitializer, err := CreateKubeAPIServerConfig(completedOptions)
 	if err != nil {
 		return nil, err
 	}
 
-	// If additional API servers are added, they should be gated.
+	// 创建api扩展配置
 	apiExtensionsConfig, err := createAPIExtensionsConfig(*kubeAPIServerConfig.GenericConfig, kubeAPIServerConfig.ExtraConfig.VersionedInformers, pluginInitializer, completedOptions.ServerRunOptions, completedOptions.MasterCount,
 		serviceResolver, webhook.NewDefaultAuthenticationInfoResolverWrapper(kubeAPIServerConfig.ExtraConfig.ProxyTransport, kubeAPIServerConfig.GenericConfig.EgressSelector, kubeAPIServerConfig.GenericConfig.LoopbackClientConfig, kubeAPIServerConfig.GenericConfig.TracerProvider))
 	if err != nil {
@@ -255,6 +256,7 @@ func CreateServerChain(completedOptions completedServerRunOptions) (*aggregatora
 	}
 
 	notFoundHandler := notfoundhandler.New(kubeAPIServerConfig.GenericConfig.Serializer, genericapifilters.NoMuxAndDiscoveryIncompleteKey)
+	// 创建api扩展server
 	apiExtensionsServer, err := createAPIExtensionsServer(apiExtensionsConfig, genericapiserver.NewEmptyDelegateWithCustomHandler(notFoundHandler))
 	if err != nil {
 		return nil, err
@@ -265,11 +267,12 @@ func CreateServerChain(completedOptions completedServerRunOptions) (*aggregatora
 		return nil, err
 	}
 
-	// aggregator comes last in the chain
+	// 创建聚合器配置
 	aggregatorConfig, err := createAggregatorConfig(*kubeAPIServerConfig.GenericConfig, completedOptions.ServerRunOptions, kubeAPIServerConfig.ExtraConfig.VersionedInformers, serviceResolver, kubeAPIServerConfig.ExtraConfig.ProxyTransport, pluginInitializer)
 	if err != nil {
 		return nil, err
 	}
+	// 创建聚合器服务
 	aggregatorServer, err := createAggregatorServer(aggregatorConfig, kubeAPIServer.GenericAPIServer, apiExtensionsServer.Informers)
 	if err != nil {
 		// we don't need special handling for innerStopCh because the aggregator server doesn't create any go routines
@@ -499,5 +502,468 @@ func (s preparedGenericAPIServer) Run(stopCh <-chan struct{}) error {
 
 	klog.V(1).Info("[graceful-termination] apiserver is exiting")
 	return nil
+}
+```
+## 3.1 创建配置
+```go
+func CreateKubeAPIServerConfig(s completedServerRunOptions) (
+	*controlplane.Config,
+	aggregatorapiserver.ServiceResolver,
+	[]admission.PluginInitializer,
+	error,
+) {
+	proxyTransport := CreateProxyTransport()
+    // 创建通用配置、informer等
+	genericConfig, versionedInformers, serviceResolver, pluginInitializers, admissionPostStartHook, storageFactory, err := buildGenericConfig(s.ServerRunOptions, proxyTransport)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	capabilities.Setup(s.AllowPrivileged, s.MaxConnectionBytesPerSec)
+
+	s.Metrics.Apply()
+	serviceaccount.RegisterMetrics()
+
+	config := &controlplane.Config{
+		GenericConfig: genericConfig,
+		ExtraConfig: controlplane.ExtraConfig{
+			APIResourceConfigSource: storageFactory.APIResourceConfigSource,
+			StorageFactory:          storageFactory,
+			EventTTL:                s.EventTTL,
+			KubeletClientConfig:     s.KubeletConfig,
+			EnableLogsSupport:       s.EnableLogsHandler,
+			ProxyTransport:          proxyTransport,
+
+			ServiceIPRange:          s.PrimaryServiceClusterIPRange,
+			APIServerServiceIP:      s.APIServerServiceIP,
+			SecondaryServiceIPRange: s.SecondaryServiceClusterIPRange,
+
+			APIServerServicePort: 443,
+
+			ServiceNodePortRange:      s.ServiceNodePortRange,
+			KubernetesServiceNodePort: s.KubernetesServiceNodePort,
+
+			EndpointReconcilerType: reconcilers.Type(s.EndpointReconcilerType),
+			MasterCount:            s.MasterCount,
+
+			ServiceAccountIssuer:        s.ServiceAccountIssuer,
+			ServiceAccountMaxExpiration: s.ServiceAccountTokenMaxExpiration,
+			ExtendExpiration:            s.Authentication.ServiceAccounts.ExtendExpiration,
+
+			VersionedInformers: versionedInformers,
+		},
+	}
+
+	clientCAProvider, err := s.Authentication.ClientCert.GetClientCAContentProvider()
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	config.ExtraConfig.ClusterAuthenticationInfo.ClientCA = clientCAProvider
+
+	requestHeaderConfig, err := s.Authentication.RequestHeader.ToAuthenticationRequestHeaderConfig()
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if requestHeaderConfig != nil {
+		config.ExtraConfig.ClusterAuthenticationInfo.RequestHeaderCA = requestHeaderConfig.CAContentProvider
+		config.ExtraConfig.ClusterAuthenticationInfo.RequestHeaderAllowedNames = requestHeaderConfig.AllowedClientNames
+		config.ExtraConfig.ClusterAuthenticationInfo.RequestHeaderExtraHeaderPrefixes = requestHeaderConfig.ExtraHeaderPrefixes
+		config.ExtraConfig.ClusterAuthenticationInfo.RequestHeaderGroupHeaders = requestHeaderConfig.GroupHeaders
+		config.ExtraConfig.ClusterAuthenticationInfo.RequestHeaderUsernameHeaders = requestHeaderConfig.UsernameHeaders
+	}
+
+	if err := config.GenericConfig.AddPostStartHook("start-kube-apiserver-admission-initializer", admissionPostStartHook); err != nil {
+		return nil, nil, nil, err
+	}
+
+	if config.GenericConfig.EgressSelector != nil {
+		// Use the config.GenericConfig.EgressSelector lookup to find the dialer to connect to the kubelet
+		config.ExtraConfig.KubeletClientConfig.Lookup = config.GenericConfig.EgressSelector.Lookup
+
+		// Use the config.GenericConfig.EgressSelector lookup as the transport used by the "proxy" subresources.
+		networkContext := egressselector.Cluster.AsNetworkContext()
+		dialer, err := config.GenericConfig.EgressSelector.Lookup(networkContext)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		c := proxyTransport.Clone()
+		c.DialContext = dialer
+		config.ExtraConfig.ProxyTransport = c
+	}
+
+	// Load the public keys.
+	var pubKeys []interface{}
+	for _, f := range s.Authentication.ServiceAccounts.KeyFiles {
+		keys, err := keyutil.PublicKeysFromFile(f)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("failed to parse key file %q: %v", f, err)
+		}
+		pubKeys = append(pubKeys, keys...)
+	}
+	// Plumb the required metadata through ExtraConfig.
+	config.ExtraConfig.ServiceAccountIssuerURL = s.Authentication.ServiceAccounts.Issuers[0]
+	config.ExtraConfig.ServiceAccountJWKSURI = s.Authentication.ServiceAccounts.JWKSURI
+	config.ExtraConfig.ServiceAccountPublicKeys = pubKeys
+
+	return config, serviceResolver, pluginInitializers, nil
+}
+```
+```go
+func buildGenericConfig(
+	s *options.ServerRunOptions,
+	proxyTransport *http.Transport,
+) (
+	genericConfig *genericapiserver.Config,
+	versionedInformers clientgoinformers.SharedInformerFactory,
+	serviceResolver aggregatorapiserver.ServiceResolver,
+	pluginInitializers []admission.PluginInitializer,
+	admissionPostStartHook genericapiserver.PostStartHookFunc,
+	storageFactory *serverstorage.DefaultStorageFactory,
+	lastErr error,
+) {
+	// legacyscheme.Codecs提供legacyscheme.Scheme编解码；genericConfig.BuildHandlerChainFunc = DefaultBuildHandlerChain（handler处理链）
+	genericConfig = genericapiserver.NewConfig(legacyscheme.Codecs)
+	genericConfig.MergedResourceConfig = controlplane.DefaultAPIResourceConfigSource()
+
+	if lastErr = s.GenericServerRunOptions.ApplyTo(genericConfig); lastErr != nil {
+		return
+	}
+
+	if lastErr = s.SecureServing.ApplyTo(&genericConfig.SecureServing, &genericConfig.LoopbackClientConfig); lastErr != nil {
+		return
+	}
+	if lastErr = s.Features.ApplyTo(genericConfig); lastErr != nil {
+		return
+	}
+	if lastErr = s.APIEnablement.ApplyTo(genericConfig, controlplane.DefaultAPIResourceConfigSource(), legacyscheme.Scheme); lastErr != nil {
+		return
+	}
+	if lastErr = s.EgressSelector.ApplyTo(genericConfig); lastErr != nil {
+		return
+	}
+	if utilfeature.DefaultFeatureGate.Enabled(genericfeatures.APIServerTracing) {
+		if lastErr = s.Traces.ApplyTo(genericConfig.EgressSelector, genericConfig); lastErr != nil {
+			return
+		}
+	}
+	// wrap the definitions to revert any changes from disabled features
+	getOpenAPIDefinitions := openapi.GetOpenAPIDefinitionsWithoutDisabledFeatures(generatedopenapi.GetOpenAPIDefinitions)
+	genericConfig.OpenAPIConfig = genericapiserver.DefaultOpenAPIConfig(getOpenAPIDefinitions, openapinamer.NewDefinitionNamer(legacyscheme.Scheme, extensionsapiserver.Scheme, aggregatorscheme.Scheme))
+	genericConfig.OpenAPIConfig.Info.Title = "Kubernetes"
+	if utilfeature.DefaultFeatureGate.Enabled(genericfeatures.OpenAPIV3) {
+		genericConfig.OpenAPIV3Config = genericapiserver.DefaultOpenAPIV3Config(getOpenAPIDefinitions, openapinamer.NewDefinitionNamer(legacyscheme.Scheme, extensionsapiserver.Scheme, aggregatorscheme.Scheme))
+		genericConfig.OpenAPIV3Config.Info.Title = "Kubernetes"
+	}
+
+	genericConfig.LongRunningFunc = filters.BasicLongRunningRequestCheck(
+		sets.NewString("watch", "proxy"),
+		sets.NewString("attach", "exec", "proxy", "log", "portforward"),
+	)
+
+	kubeVersion := version.Get()
+	genericConfig.Version = &kubeVersion
+
+	if genericConfig.EgressSelector != nil {
+		s.Etcd.StorageConfig.Transport.EgressLookup = genericConfig.EgressSelector.Lookup
+	}
+	if utilfeature.DefaultFeatureGate.Enabled(genericfeatures.APIServerTracing) {
+		s.Etcd.StorageConfig.Transport.TracerProvider = genericConfig.TracerProvider
+	} else {
+		s.Etcd.StorageConfig.Transport.TracerProvider = oteltrace.NewNoopTracerProvider()
+	}
+	if lastErr = s.Etcd.Complete(genericConfig.StorageObjectCountTracker, genericConfig.DrainedNotify(), genericConfig.AddPostStartHook); lastErr != nil {
+		return
+	}
+
+	storageFactoryConfig := kubeapiserver.NewStorageFactoryConfig()
+	storageFactoryConfig.APIResourceConfig = genericConfig.MergedResourceConfig
+	storageFactory, lastErr = storageFactoryConfig.Complete(s.Etcd).New()
+	if lastErr != nil {
+		return
+	}
+	if lastErr = s.Etcd.ApplyWithStorageFactoryTo(storageFactory, genericConfig); lastErr != nil {
+		return
+	}
+
+	// Use protobufs for self-communication.
+	// Since not every generic apiserver has to support protobufs, we
+	// cannot default to it in generic apiserver and need to explicitly
+	// set it in kube-apiserver.
+	genericConfig.LoopbackClientConfig.ContentConfig.ContentType = "application/vnd.kubernetes.protobuf"
+	// Disable compression for self-communication, since we are going to be
+	// on a fast local network
+	genericConfig.LoopbackClientConfig.DisableCompression = true
+
+	kubeClientConfig := genericConfig.LoopbackClientConfig
+	clientgoExternalClient, err := clientgoclientset.NewForConfig(kubeClientConfig)
+	if err != nil {
+		lastErr = fmt.Errorf("failed to create real external clientset: %v", err)
+		return
+	}
+	versionedInformers = clientgoinformers.NewSharedInformerFactory(clientgoExternalClient, 10*time.Minute)
+
+	// Authentication.ApplyTo requires already applied OpenAPIConfig and EgressSelector if present
+	if lastErr = s.Authentication.ApplyTo(&genericConfig.Authentication, genericConfig.SecureServing, genericConfig.EgressSelector, genericConfig.OpenAPIConfig, genericConfig.OpenAPIV3Config, clientgoExternalClient, versionedInformers); lastErr != nil {
+		return
+	}
+    // 构建认证器
+	genericConfig.Authorization.Authorizer, genericConfig.RuleResolver, err = BuildAuthorizer(s, genericConfig.EgressSelector, versionedInformers)
+	if err != nil {
+		lastErr = fmt.Errorf("invalid authorization config: %v", err)
+		return
+	}
+	if !sets.NewString(s.Authorization.Modes...).Has(modes.ModeRBAC) {
+		genericConfig.DisabledPostStartHooks.Insert(rbacrest.PostStartHookName)
+	}
+
+	lastErr = s.Audit.ApplyTo(genericConfig)
+	if lastErr != nil {
+		return
+	}
+
+	admissionConfig := &kubeapiserveradmission.Config{
+		ExternalInformers:    versionedInformers,
+		LoopbackClientConfig: genericConfig.LoopbackClientConfig,
+		CloudConfigFile:      s.CloudProvider.CloudConfigFile,
+	}
+	serviceResolver = buildServiceResolver(s.EnableAggregatorRouting, genericConfig.LoopbackClientConfig.Host, versionedInformers)
+	pluginInitializers, admissionPostStartHook, err = admissionConfig.New(proxyTransport, genericConfig.EgressSelector, serviceResolver, genericConfig.TracerProvider)
+	if err != nil {
+		lastErr = fmt.Errorf("failed to create admission plugin initializer: %v", err)
+		return
+	}
+
+	err = s.Admission.ApplyTo(
+		genericConfig,
+		versionedInformers,
+		kubeClientConfig,
+		utilfeature.DefaultFeatureGate,
+		pluginInitializers...)
+	if err != nil {
+		lastErr = fmt.Errorf("failed to initialize admission: %v", err)
+		return
+	}
+
+	if utilfeature.DefaultFeatureGate.Enabled(genericfeatures.APIPriorityAndFairness) && s.GenericServerRunOptions.EnablePriorityAndFairness {
+		genericConfig.FlowControl, lastErr = BuildPriorityAndFairness(s, clientgoExternalClient, versionedInformers)
+	}
+	if utilfeature.DefaultFeatureGate.Enabled(genericfeatures.AggregatedDiscoveryEndpoint) {
+		genericConfig.AggregatedDiscoveryGroupManager = aggregated.NewResourceManager()
+	}
+
+	return
+}
+```
+```go
+func createAPIExtensionsConfig(
+	kubeAPIServerConfig genericapiserver.Config,
+	externalInformers kubeexternalinformers.SharedInformerFactory,
+	pluginInitializers []admission.PluginInitializer,
+	commandOptions *options.ServerRunOptions,
+	masterCount int,
+	serviceResolver webhook.ServiceResolver,
+	authResolverWrapper webhook.AuthenticationInfoResolverWrapper,
+) (*apiextensionsapiserver.Config, error) {
+	// make a shallow copy to let us twiddle a few things
+	// most of the config actually remains the same.  We only need to mess with a couple items related to the particulars of the apiextensions
+	genericConfig := kubeAPIServerConfig
+	genericConfig.PostStartHooks = map[string]genericapiserver.PostStartHookConfigEntry{}
+	genericConfig.RESTOptionsGetter = nil
+
+	// copy the etcd options so we don't mutate originals.
+	// we assume that the etcd options have been completed already.  avoid messing with anything outside
+	// of changes to StorageConfig as that may lead to unexpected behavior when the options are applied.
+	etcdOptions := *commandOptions.Etcd
+	etcdOptions.StorageConfig.Paging = utilfeature.DefaultFeatureGate.Enabled(features.APIListChunking)
+	// this is where the true decodable levels come from.
+	etcdOptions.StorageConfig.Codec = apiextensionsapiserver.Codecs.LegacyCodec(v1beta1.SchemeGroupVersion, v1.SchemeGroupVersion)
+	// prefer the more compact serialization (v1beta1) for storage until https://issue.k8s.io/82292 is resolved for objects whose v1 serialization is too big but whose v1beta1 serialization can be stored
+	etcdOptions.StorageConfig.EncodeVersioner = runtime.NewMultiGroupVersioner(v1beta1.SchemeGroupVersion, schema.GroupKind{Group: v1beta1.GroupName})
+	etcdOptions.SkipHealthEndpoints = true // avoid double wiring of health checks
+	if err := etcdOptions.ApplyTo(&genericConfig); err != nil {
+		return nil, err
+	}
+
+	// override MergedResourceConfig with apiextensions defaults and registry
+	if err := commandOptions.APIEnablement.ApplyTo(
+		&genericConfig,
+		apiextensionsapiserver.DefaultAPIResourceConfigSource(),
+		apiextensionsapiserver.Scheme); err != nil {
+		return nil, err
+	}
+	crdRESTOptionsGetter, err := apiextensionsoptions.NewCRDRESTOptionsGetter(etcdOptions)
+	if err != nil {
+		return nil, err
+	}
+	apiextensionsConfig := &apiextensionsapiserver.Config{
+		GenericConfig: &genericapiserver.RecommendedConfig{
+			Config:                genericConfig,
+			SharedInformerFactory: externalInformers,
+		},
+		ExtraConfig: apiextensionsapiserver.ExtraConfig{
+			CRDRESTOptionsGetter: crdRESTOptionsGetter,
+			MasterCount:          masterCount,
+			AuthResolverWrapper:  authResolverWrapper,
+			ServiceResolver:      serviceResolver,
+		},
+	}
+
+	// we need to clear the poststarthooks so we don't add them multiple times to all the servers (that fails)
+	apiextensionsConfig.GenericConfig.PostStartHooks = map[string]genericapiserver.PostStartHookConfigEntry{}
+
+	return apiextensionsConfig, nil
+}
+```
+## 3.1 创建api扩展server
+```go
+func createAPIExtensionsServer(apiextensionsConfig *apiextensionsapiserver.Config, delegateAPIServer genericapiserver.DelegationTarget) (*apiextensionsapiserver.CustomResourceDefinitions, error) {
+	return apiextensionsConfig.Complete().New(delegateAPIServer)
+}
+```
+```go
+func (c completedConfig) New(delegationTarget genericapiserver.DelegationTarget) (*CustomResourceDefinitions, error) {
+	// 创建通用server
+	genericServer, err := c.GenericConfig.New("apiextensions-apiserver", delegationTarget)
+	if err != nil {
+		return nil, err
+	}
+
+	// hasCRDInformerSyncedSignal is closed when the CRD informer this server uses has been fully synchronized.
+	// It ensures that requests to potential custom resource endpoints while the server hasn't installed all known HTTP paths get a 503 error instead of a 404
+	hasCRDInformerSyncedSignal := make(chan struct{})
+	if err := genericServer.RegisterMuxAndDiscoveryCompleteSignal("CRDInformerHasNotSynced", hasCRDInformerSyncedSignal); err != nil {
+		return nil, err
+	}
+
+	s := &CustomResourceDefinitions{
+		GenericAPIServer: genericServer,
+	}
+
+	apiResourceConfig := c.GenericConfig.MergedResourceConfig
+	apiGroupInfo := genericapiserver.NewDefaultAPIGroupInfo(apiextensions.GroupName, Scheme, metav1.ParameterCodec, Codecs)
+	storage := map[string]rest.Storage{}
+	// customresourcedefinitions
+	if resource := "customresourcedefinitions"; apiResourceConfig.ResourceEnabled(v1.SchemeGroupVersion.WithResource(resource)) {
+		customResourceDefinitionStorage, err := customresourcedefinition.NewREST(Scheme, c.GenericConfig.RESTOptionsGetter)
+		if err != nil {
+			return nil, err
+		}
+		storage[resource] = customResourceDefinitionStorage
+		storage[resource+"/status"] = customresourcedefinition.NewStatusREST(Scheme, customResourceDefinitionStorage)
+	}
+	if len(storage) > 0 {
+		apiGroupInfo.VersionedResourcesStorageMap[v1.SchemeGroupVersion.Version] = storage
+	}
+
+	if err := s.GenericAPIServer.InstallAPIGroup(&apiGroupInfo); err != nil {
+		return nil, err
+	}
+
+	crdClient, err := clientset.NewForConfig(s.GenericAPIServer.LoopbackClientConfig)
+	if err != nil {
+		// it's really bad that this is leaking here, but until we can fix the test (which I'm pretty sure isn't even testing what it wants to test),
+		// we need to be able to move forward
+		return nil, fmt.Errorf("failed to create clientset: %v", err)
+	}
+	s.Informers = externalinformers.NewSharedInformerFactory(crdClient, 5*time.Minute)
+
+	delegateHandler := delegationTarget.UnprotectedHandler()
+	if delegateHandler == nil {
+		delegateHandler = http.NotFoundHandler()
+	}
+
+	versionDiscoveryHandler := &versionDiscoveryHandler{
+		discovery: map[schema.GroupVersion]*discovery.APIVersionHandler{},
+		delegate:  delegateHandler,
+	}
+	groupDiscoveryHandler := &groupDiscoveryHandler{
+		discovery: map[string]*discovery.APIGroupHandler{},
+		delegate:  delegateHandler,
+	}
+	establishingController := establish.NewEstablishingController(s.Informers.Apiextensions().V1().CustomResourceDefinitions(), crdClient.ApiextensionsV1())
+	crdHandler, err := NewCustomResourceDefinitionHandler(
+		versionDiscoveryHandler,
+		groupDiscoveryHandler,
+		s.Informers.Apiextensions().V1().CustomResourceDefinitions(),
+		delegateHandler,
+		c.ExtraConfig.CRDRESTOptionsGetter,
+		c.GenericConfig.AdmissionControl,
+		establishingController,
+		c.ExtraConfig.ServiceResolver,
+		c.ExtraConfig.AuthResolverWrapper,
+		c.ExtraConfig.MasterCount,
+		s.GenericAPIServer.Authorizer,
+		c.GenericConfig.RequestTimeout,
+		time.Duration(c.GenericConfig.MinRequestTimeout)*time.Second,
+		apiGroupInfo.StaticOpenAPISpec,
+		c.GenericConfig.MaxRequestBodyBytes,
+	)
+	if err != nil {
+		return nil, err
+	}
+	s.GenericAPIServer.Handler.NonGoRestfulMux.Handle("/apis", crdHandler)
+	s.GenericAPIServer.Handler.NonGoRestfulMux.HandlePrefix("/apis/", crdHandler)
+	s.GenericAPIServer.RegisterDestroyFunc(crdHandler.destroy)
+
+	discoveryController := NewDiscoveryController(s.Informers.Apiextensions().V1().CustomResourceDefinitions(), versionDiscoveryHandler, groupDiscoveryHandler, genericServer.AggregatedDiscoveryGroupManager)
+	namingController := status.NewNamingConditionController(s.Informers.Apiextensions().V1().CustomResourceDefinitions(), crdClient.ApiextensionsV1())
+	nonStructuralSchemaController := nonstructuralschema.NewConditionController(s.Informers.Apiextensions().V1().CustomResourceDefinitions(), crdClient.ApiextensionsV1())
+	apiApprovalController := apiapproval.NewKubernetesAPIApprovalPolicyConformantConditionController(s.Informers.Apiextensions().V1().CustomResourceDefinitions(), crdClient.ApiextensionsV1())
+	finalizingController := finalizer.NewCRDFinalizer(
+		s.Informers.Apiextensions().V1().CustomResourceDefinitions(),
+		crdClient.ApiextensionsV1(),
+		crdHandler,
+	)
+
+	s.GenericAPIServer.AddPostStartHookOrDie("start-apiextensions-informers", func(context genericapiserver.PostStartHookContext) error {
+		s.Informers.Start(context.StopCh)
+		return nil
+	})
+	s.GenericAPIServer.AddPostStartHookOrDie("start-apiextensions-controllers", func(context genericapiserver.PostStartHookContext) error {
+		// OpenAPIVersionedService and StaticOpenAPISpec are populated in generic apiserver PrepareRun().
+		// Together they serve the /openapi/v2 endpoint on a generic apiserver. A generic apiserver may
+		// choose to not enable OpenAPI by having null openAPIConfig, and thus OpenAPIVersionedService
+		// and StaticOpenAPISpec are both null. In that case we don't run the CRD OpenAPI controller.
+		if s.GenericAPIServer.StaticOpenAPISpec != nil {
+			if s.GenericAPIServer.OpenAPIVersionedService != nil {
+				openapiController := openapicontroller.NewController(s.Informers.Apiextensions().V1().CustomResourceDefinitions())
+				go openapiController.Run(s.GenericAPIServer.StaticOpenAPISpec, s.GenericAPIServer.OpenAPIVersionedService, context.StopCh)
+			}
+
+			if s.GenericAPIServer.OpenAPIV3VersionedService != nil && utilfeature.DefaultFeatureGate.Enabled(features.OpenAPIV3) {
+				openapiv3Controller := openapiv3controller.NewController(s.Informers.Apiextensions().V1().CustomResourceDefinitions())
+				go openapiv3Controller.Run(s.GenericAPIServer.OpenAPIV3VersionedService, context.StopCh)
+			}
+		}
+
+		go namingController.Run(context.StopCh)
+		go establishingController.Run(context.StopCh)
+		go nonStructuralSchemaController.Run(5, context.StopCh)
+		go apiApprovalController.Run(5, context.StopCh)
+		go finalizingController.Run(5, context.StopCh)
+
+		discoverySyncedCh := make(chan struct{})
+		go discoveryController.Run(context.StopCh, discoverySyncedCh)
+		select {
+		case <-context.StopCh:
+		case <-discoverySyncedCh:
+		}
+
+		return nil
+	})
+	// we don't want to report healthy until we can handle all CRDs that have already been registered.  Waiting for the informer
+	// to sync makes sure that the lister will be valid before we begin.  There may still be races for CRDs added after startup,
+	// but we won't go healthy until we can handle the ones already present.
+	s.GenericAPIServer.AddPostStartHookOrDie("crd-informer-synced", func(context genericapiserver.PostStartHookContext) error {
+		return wait.PollImmediateUntil(100*time.Millisecond, func() (bool, error) {
+			if s.Informers.Apiextensions().V1().CustomResourceDefinitions().Informer().HasSynced() {
+				close(hasCRDInformerSyncedSignal)
+				return true, nil
+			}
+			return false, nil
+		}, context.StopCh)
+	})
+
+	return s, nil
 }
 ```
