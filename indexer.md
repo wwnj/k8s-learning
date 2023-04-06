@@ -24,7 +24,7 @@ var index = map[string]id{}
 ```
 这样要通过名称查缓存，通过idCache[index[name]]即可。kubernetes indexer就是类似的思路，indexer支持任意类型，线程安全
 ## 2.使用
-参考[TestMultiIndexKeys单侧(https://github.com/kubernetes/kubernetes/blob/v1.26.3/staging/src/k8s.io/client-go/tools/cache/index_test.go)
+参考[TestMultiIndexKeys单侧](https://github.com/kubernetes/kubernetes/blob/v1.26.3/staging/src/k8s.io/client-go/tools/cache/index_test.go)
 ```go
 // 取pod中标签foo的值作为索引值
 func testIndexFunc(obj interface{}) ([]string, error) {
