@@ -135,11 +135,100 @@ func NewThreadSafeStore(indexers Indexers, indices Indices) ThreadSafeStore {
 ```
 ```go
 func (c *cache) Add(obj interface{}) error {
+	// 计算缓存key
 	key, err := c.keyFunc(obj)
 	if err != nil {
 		return KeyError{obj, err}
 	}
 	c.cacheStorage.Add(key, obj)
 	return nil
+}
+```
+```go
+func (c *threadSafeMap) Add(key string, obj interface{}) {
+	c.Update(key, obj)
+}
+
+func (c *threadSafeMap) Update(key string, obj interface{}) {
+	// 更新操作，加锁
+    c.lock.Lock()
+    defer c.lock.Unlock()
+	// 获取旧缓存对象
+    oldObject := c.items[key]
+	// 设置新缓存对象
+    c.items[key] = obj
+	// 更新索引
+    c.index.updateIndices(oldObject, obj, key)
+}
+```
+```go
+func (i *storeIndex) updateIndices(oldObj interface{}, newObj interface{}, key string) {
+	var oldIndexValues, indexValues []string
+	var err error
+	// 遍历所有索引器
+	for name, indexFunc := range i.indexers {
+		// 在缓存对象第一次添加的时候，oldObj为nil
+		if oldObj != nil {
+			// 计算旧的索引值
+			oldIndexValues, err = indexFunc(oldObj)
+		} else {
+			oldIndexValues = oldIndexValues[:0]
+		}
+		if err != nil {
+			panic(fmt.Errorf("unable to calculate an index entry for key %q on index %q: %v", key, name, err))
+		}
+
+		if newObj != nil {
+            // 计算新的索引值
+			indexValues, err = indexFunc(newObj)
+		} else {
+			indexValues = indexValues[:0]
+		}
+		if err != nil {
+			panic(fmt.Errorf("unable to calculate an index entry for key %q on index %q: %v", key, name, err))
+		}
+        // 通过索引名找到索引，为空则创建
+		index := i.indices[name]
+		if index == nil {
+			index = Index{}
+			i.indices[name] = index
+		}
+        // 一个小优化，当添加的新值和旧值都为1并且相同时，无需处理
+		if len(indexValues) == 1 && len(oldIndexValues) == 1 && indexValues[0] == oldIndexValues[0] {
+			// We optimize for the most common case where indexFunc returns a single value which has not been changed
+			continue
+		}
+        // 从索引中删除key
+		for _, value := range oldIndexValues {
+			i.deleteKeyFromIndex(key, value, index)
+		}
+        // 从索引中添加key
+		for _, value := range indexValues {
+			i.addKeyToIndex(key, value, index)
+		}
+	}
+}
+
+func (i *storeIndex) addKeyToIndex(key, indexValue string, index Index) {
+    set := index[indexValue]
+    if set == nil {
+        set = sets.String{}
+        index[indexValue] = set
+    }
+	// 索引名+索引值可能对应多个缓存key，通过set去重
+    set.Insert(key)
+}
+
+func (i *storeIndex) deleteKeyFromIndex(key, indexValue string, index Index) {
+    set := index[indexValue]
+    if set == nil {
+        return
+    }
+    // 删除缓存key
+    set.Delete(key)
+    // 当缓存key的set为空时，删除索引值的映射，避免oom
+    if len(set) == 0 {
+        delete(index, indexValue)
+    }
 }
 ```
