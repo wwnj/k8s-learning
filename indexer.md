@@ -1,4 +1,4 @@
-# kubernetes indexer分析
+# kubernetes indexer源码解析
 kubernetes indexer是实现了多索引的本地缓存
 ## 1.背景
 以db中学校学生表做本地缓存为例
@@ -107,7 +107,7 @@ func TestMultiIndexKeys(t *testing.T) {
 	}
 }
 ```
-## 3.源码分析
+## 3.源码解析
 ```go
 func NewIndexer(keyFunc KeyFunc, indexers Indexers) Indexer {
 	return &cache{
@@ -232,3 +232,5 @@ func (i *storeIndex) deleteKeyFromIndex(key, indexValue string, index Index) {
     }
 }
 ```
+## 4.总结
+kubernetes indexer在实现多索引的本地缓存的思路，特别在代码可复用方面，值得我们学习借鉴
