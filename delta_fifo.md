@@ -5,7 +5,7 @@ kubernetes delta_fifo是一个先入先出队列，相较于fifo，有两点不�
 - 当Deltas最后一个元素Delta.DeltaType已经是Deleted类型时，再添加一个Deleted类型的Delta，Deltas不再新增 
 delta_fifo的API与fifo类型，不再具体分析
 ## 2.使用
-参考[TestFIFO_requeueOnPop](https://github.com/kubernetes/kubernetes/blob/v1.26.3/staging/src/k8s.io/client-go/tools/cache/fifo_test.go#L75)
+参考[TestDeltaFIFO_ReplaceMakesDeletions](https://github.com/kubernetes/kubernetes/blob/v1.26.3/staging/src/k8s.io/client-go/tools/cache/delta_fifo_test.go#L333)
 ```go
 // 取testFifoObject中name作为key
 func testFifoObjectKeyFunc(obj interface{}) (string, error) {
