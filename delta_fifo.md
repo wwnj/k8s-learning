@@ -21,14 +21,11 @@ func mkFifoObj(name string, val interface{}) testFifoObject {
     return testFifoObject{name: name, val: val}
 }
 
-// literalListerGetter is a KeyListerGetter that is based on a
-// function that returns a slice of objects to list and get.
-// The function must list the same objects every time.
+// literalListerGetter实现了KeyListerGetter接口
 type literalListerGetter func() []testFifoObject
 
 var _ KeyListerGetter = literalListerGetter(nil)
 
-// ListKeys just calls kl.
 func (kl literalListerGetter) ListKeys() []string {
     result := []string{}
     for _, fifoObj := range kl() {
@@ -37,7 +34,6 @@ func (kl literalListerGetter) ListKeys() []string {
     return result
 }
 
-// GetByKey returns the key if it exists in the list returned by kl.
 func (kl literalListerGetter) GetByKey(key string) (interface{}, bool, error) {
     for _, v := range kl() {
         if v.name == key {
@@ -48,24 +44,20 @@ func (kl literalListerGetter) GetByKey(key string) (interface{}, bool, error) {
 }
 
 func TestDeltaFIFO_ReplaceMakesDeletions(t *testing.T) {
-    // We test with only one pre-existing object because there is no
-    // promise about how their deletes are ordered.
-    
-    // Try it with a pre-existing Delete
     f := NewDeltaFIFOWithOptions(DeltaFIFOOptions{
         KeyFunction: testFifoObjectKeyFunc,
         KnownObjects: literalListerGetter(func() []testFifoObject {
             return []testFifoObject{mkFifoObj("foo", 5), mkFifoObj("bar", 6), mkFifoObj("baz", 7)}
         }),
     })
+	// 删除
     f.Delete(mkFifoObj("baz", 10))
+	// 替换，f.emitDeltaTypeReplaced为false时action为Sync，否则action为Replace
     f.Replace([]interface{}{mkFifoObj("foo", 5)}, "0")
-    
+    // 期望的列表
     expectedList := []Deltas{
         {{Deleted, mkFifoObj("baz", 10)}},
         {{Sync, mkFifoObj("foo", 5)}},
-        // Since "bar" didn't have a delete event and wasn't in the Replace list
-        // it should get a tombstone key with the right Obj.
         {{Deleted, DeletedFinalStateUnknown{Key: "bar", Obj: mkFifoObj("bar", 6)}}},
     }
     
@@ -76,7 +68,6 @@ func TestDeltaFIFO_ReplaceMakesDeletions(t *testing.T) {
         }
     }
     
-    // Now try starting with an Add instead of a Delete
     f = NewDeltaFIFOWithOptions(DeltaFIFOOptions{
     KeyFunction: testFifoObjectKeyFunc,
     KnownObjects: literalListerGetter(func() []testFifoObject {
@@ -90,8 +81,6 @@ func TestDeltaFIFO_ReplaceMakesDeletions(t *testing.T) {
         {{Added, mkFifoObj("baz", 10)},
         {Deleted, DeletedFinalStateUnknown{Key: "baz", Obj: mkFifoObj("baz", 7)}}},
         {{Sync, mkFifoObj("foo", 5)}},
-        // Since "bar" didn't have a delete event and wasn't in the Replace list
-        // it should get a tombstone key with the right Obj.
         {{Deleted, DeletedFinalStateUnknown{Key: "bar", Obj: mkFifoObj("bar", 6)}}},
     }
     
@@ -102,7 +91,6 @@ func TestDeltaFIFO_ReplaceMakesDeletions(t *testing.T) {
         }
     }
     
-    // Now try starting without an explicit KeyListerGetter
     f = NewDeltaFIFOWithOptions(DeltaFIFOOptions{KeyFunction: testFifoObjectKeyFunc})
     f.Add(mkFifoObj("baz", 10))
     f.Replace([]interface{}{mkFifoObj("foo", 5)}, "0")
