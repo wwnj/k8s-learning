@@ -190,6 +190,7 @@ func (f *DeltaFIFO) queueActionLocked(actionType DeltaType, obj interface{}) err
     }
     oldDeltas := f.items[id]
     newDeltas := append(oldDeltas, Delta{actionType, obj})
+	// delete类型是否重复了
     newDeltas = dedupDeltas(newDeltas)
     
     if len(newDeltas) > 0 {
@@ -199,9 +200,7 @@ func (f *DeltaFIFO) queueActionLocked(actionType DeltaType, obj interface{}) err
         f.items[id] = newDeltas
         f.cond.Broadcast()
     } else {
-        // This never happens, because dedupDeltas never returns an empty list
-        // when given a non-empty list (as it is here).
-        // If somehow it happens anyway, deal with it but complain.
+        // 正常情况，不应该走到这个分支
         if oldDeltas == nil {
             klog.Errorf("Impossible dedupDeltas for id=%q: oldDeltas=%#+v, obj=%#+v; ignoring", id, oldDeltas, obj)
             return nil
@@ -213,8 +212,6 @@ func (f *DeltaFIFO) queueActionLocked(actionType DeltaType, obj interface{}) err
     return nil
 }
 
-// re-listing and watching can deliver the same update multiple times in any
-// order. This will combine the most recent two deltas if they are the same.
 func dedupDeltas(deltas Deltas) Deltas {
     n := len(deltas)
     if n < 2 {
@@ -229,23 +226,19 @@ func dedupDeltas(deltas Deltas) Deltas {
     return deltas
 }
 
-// If a & b represent the same event, returns the delta that ought to be kept.
-// Otherwise, returns nil.
-// TODO: is there anything other than deletions that need deduping?
 func isDup(a, b *Delta) *Delta {
+	// 是否删除类型重复
     if out := isDeletionDup(a, b); out != nil {
         return out
     }
-    // TODO: Detect other duplicate situations? Are there any?
     return nil
 }
 
-// keep the one with the most information if both are deletions.
 func isDeletionDup(a, b *Delta) *Delta {
     if b.Type != Deleted || a.Type != Deleted {
         return nil
     }
-    // Do more sophisticated checks, or is this sufficient?
+    // 都为delete类型，并且b.Object是DeletedFinalStateUnknown类型，则保留a，否则保留b
     if _, ok := b.Object.(DeletedFinalStateUnknown); ok {
         return a
     }
@@ -253,53 +246,91 @@ func isDeletionDup(a, b *Delta) *Delta {
 }
 ```
 ```go
-func (f *FIFO) Pop(process PopProcessFunc) (interface{}, error) {
+// Replace逻辑如下: (1) 添加Sync或Replace Delta类型对象
+// (2) 删除操作：对于每个已经存在的keys，但不存在于list中的对象，添加Delete(DeletedFinalStateUnknown{K, O})对象，其中O是K关联的对象；
+// 如果f.knownObjects为空， 已经存在的keys是f.items，O是K关联的Deltas.Newest()；
+// 如果f.knownObjects不为空，已经存在的keys是f.knownObjects，O是f.knownObjects.GetByKey(K)的返回值
+func (f *DeltaFIFO) Replace(list []interface{}, _ string) error {
     f.lock.Lock()
     defer f.lock.Unlock()
-    for {
-        for len(f.queue) == 0 {
-            // 当队列为空时, 避免只有item入队时Pop才可以退出；当f.Close()调用时，Pop也可以退出
-            if f.closed {
-                return nil, ErrFIFOClosed
-            }
-            // 等待条件变量唤醒
-            f.cond.Wait()
-        }
-		// 从对头取，先入先出
-        id := f.queue[0]
-        f.queue = f.queue[1:]
-		// 当Replace先被调用时，initialPopulationCount才可能大于0
-        if f.initialPopulationCount > 0 {
-            f.initialPopulationCount--
-        }
-        item, ok := f.items[id]
-        if !ok {
-            // item有可能随后被删除，当被删除时不进行后续操作
-            continue
-        }
-		// 删除item
-        delete(f.items, id)
-		// 调用item处理函数，如果返回ErrRequeue时，重入队，以便重复消费
-        err := process(item)
-        if e, ok := err.(ErrRequeue); ok {
-            f.addIfNotPresent(id, item)
-            err = e.Err
-        }
-        return item, err
+    keys := make(sets.String, len(list))
+    
+    // 兼容老版本的客户端
+    action := Sync
+    if f.emitDeltaTypeReplaced {
+        action = Replaced
     }
+	
+    for _, item := range list {
+        key, err := f.KeyOf(item)
+        if err != nil {
+            return KeyError{item, err}
+        }
+        keys.Insert(key)
+		// 每个list中的item添加Sync/Replaced类型
+        if err := f.queueActionLocked(action, item); err != nil {
+            return fmt.Errorf("couldn't enqueue object: %v", err)
+        }
+    }
+    
+    if f.knownObjects == nil {
+        // Do deletion detection against our own list.
+        queuedDeletions := 0
+        for k, oldItem := range f.items {
+            if keys.Has(k) {
+                continue
+            }
+
+            var deletedObj interface{}
+			// 取最新的一个obj
+            if n := oldItem.Newest(); n != nil {
+                deletedObj = n.Object
+            }
+            queuedDeletions++
+            if err := f.queueActionLocked(Deleted, DeletedFinalStateUnknown{k, deletedObj}); err != nil {
+                return err
+            }
+        }
+    
+        if !f.populated {
+            f.populated = true
+            f.initialPopulationCount = keys.Len() + queuedDeletions
+        }
+        
+        return nil
+    }
+    
+    knownKeys := f.knownObjects.ListKeys()
+    queuedDeletions := 0
+    for _, k := range knownKeys {
+        if keys.Has(k) {
+        continue
+    }
+	// 取f.knownObjects.GetByKey的返回值
+    deletedObj, exists, err := f.knownObjects.GetByKey(k)
+    if err != nil {
+        deletedObj = nil
+        klog.Errorf("Unexpected error %v during lookup of key %v, placing DeleteFinalStateUnknown marker without object", err, k)
+    } else if !exists {
+        deletedObj = nil
+        klog.Infof("Key %v does not exist in known objects store, placing DeleteFinalStateUnknown marker without object", k)
+    }
+    queuedDeletions++
+    if err := f.queueActionLocked(Deleted, DeletedFinalStateUnknown{k, deletedObj}); err != nil {
+        return err
+        }
+    }
+    
+    if !f.populated {
+        f.populated = true
+        f.initialPopulationCount = keys.Len() + queuedDeletions
+    }
+    
+    return nil
 }
 ```
 ```go
-func (f *FIFO) addIfNotPresent(id string, obj interface{}) {
-    f.populated = true
-    if _, exists := f.items[id]; exists {
-        return
-    }
-    
-    f.queue = append(f.queue, id)
-    f.items[id] = obj
-    f.cond.Broadcast()
-}
+Add、Pop
 ```
 ## 4.总结
 kubernetes fifo在实现先入先出队列上，值得我们学习借鉴
