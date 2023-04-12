@@ -111,39 +111,146 @@ func TestDeltaFIFO_ReplaceMakesDeletions(t *testing.T) {
 ```
 ## 3.源码解析
 ```go
-func NewFIFO(keyFunc KeyFunc) *FIFO {
-    f := &FIFO{
-		// key和obj的映射
-        items:   map[string]interface{}{},
-		// key的队列，先入先出
-        queue:   []string{},
-		// obj和key的映射函数
-        keyFunc: keyFunc,
+func NewDeltaFIFOWithOptions(opts DeltaFIFOOptions) *DeltaFIFO {
+    if opts.KeyFunction == nil {
+        opts.KeyFunction = MetaNamespaceKeyFunc
     }
-	// f.cond.L持有f.lock
+    
+    f := &DeltaFIFO{
+        items:        map[string]Deltas{},
+        queue:        []string{},
+        keyFunc:      opts.KeyFunction,
+        knownObjects: opts.KnownObjects,
+        
+        emitDeltaTypeReplaced: opts.EmitDeltaTypeReplaced,
+    }
     f.cond.L = &f.lock
-return f
+    return f
 }
 ```
 ```go
-func (f *FIFO) Add(obj interface{}) error {
-    id, err := f.keyFunc(obj)
+// 计算obj对应的key
+func (f *DeltaFIFO) KeyOf(obj interface{}) (string, error) {
+	// 如果obj为Deltas类型
+    if d, ok := obj.(Deltas); ok {
+		// 如果没有值，抛err
+        if len(d) == 0 {
+            return "", KeyError{obj, ErrZeroLengthDeltasObject}
+        }
+		// 取最新的obj
+        obj = d.Newest().Object
+    }
+	// 如果obj为DeletedFinalStateUnknown类型，则直接返回DeletedFinalStateUnknown.Key
+    if d, ok := obj.(DeletedFinalStateUnknown); ok {
+        return d.Key, nil
+    }
+	// 否则，使用keyFunc
+    return f.keyFunc(obj)
+}
+
+func (d Deltas) Newest() *Delta {
+    if n := len(d); n > 0 {
+        return &d[n-1]
+    }
+    return nil
+}
+
+// Delete方法添加Deleted类型的Delta，如果f.knownObjects为nil并且obj不存在时，不做处理；如果f.knownObjects不为nil，且f.knownObjects.GetByKey(id)不存在并且f.items[id]不存在，不做处理
+func (f *DeltaFIFO) Delete(obj interface{}) error {
+	// 计算obj对应的key
+    id, err := f.KeyOf(obj)
     if err != nil {
         return KeyError{obj, err}
     }
     f.lock.Lock()
     defer f.lock.Unlock()
     f.populated = true
-	// items中不存在时，才入队
-    if _, exists := f.items[id]; !exists {
-        f.queue = append(f.queue, id)
+    if f.knownObjects == nil {
+		// 如果f.items不存在则不处理
+        if _, exists := f.items[id]; !exists {
+            return nil
+        }
+    } else {
+        _, exists, err := f.knownObjects.GetByKey(id)
+        _, itemsExist := f.items[id]
+		// 如果f.knownObjects.GetByKey(id)和f.items[id]都不存在，则不处理
+        if err == nil && !exists && !itemsExist {
+            return nil
+        }
     }
-    f.items[id] = obj
-	// 唤醒所有等待在f.cond的协程，其实就是Pop在等待f.cond
-    f.cond.Broadcast()
+    // Deleted类型入队
+    return f.queueActionLocked(Deleted, obj)
+}
+
+func (f *DeltaFIFO) queueActionLocked(actionType DeltaType, obj interface{}) error {
+    // 计算obj对应的key
+    id, err := f.KeyOf(obj)
+    if err != nil {
+        return KeyError{obj, err}
+    }
+    oldDeltas := f.items[id]
+    newDeltas := append(oldDeltas, Delta{actionType, obj})
+    newDeltas = dedupDeltas(newDeltas)
+    
+    if len(newDeltas) > 0 {
+        if _, exists := f.items[id]; !exists {
+            f.queue = append(f.queue, id)
+        }
+        f.items[id] = newDeltas
+        f.cond.Broadcast()
+    } else {
+        // This never happens, because dedupDeltas never returns an empty list
+        // when given a non-empty list (as it is here).
+        // If somehow it happens anyway, deal with it but complain.
+        if oldDeltas == nil {
+            klog.Errorf("Impossible dedupDeltas for id=%q: oldDeltas=%#+v, obj=%#+v; ignoring", id, oldDeltas, obj)
+            return nil
+        }
+        klog.Errorf("Impossible dedupDeltas for id=%q: oldDeltas=%#+v, obj=%#+v; breaking invariant by storing empty Deltas", id, oldDeltas, obj)
+        f.items[id] = newDeltas
+        return fmt.Errorf("Impossible dedupDeltas for id=%q: oldDeltas=%#+v, obj=%#+v; broke DeltaFIFO invariant by storing empty Deltas", id, oldDeltas, obj)
+    }
     return nil
 }
 
+// re-listing and watching can deliver the same update multiple times in any
+// order. This will combine the most recent two deltas if they are the same.
+func dedupDeltas(deltas Deltas) Deltas {
+    n := len(deltas)
+    if n < 2 {
+        return deltas
+    }
+    a := &deltas[n-1]
+    b := &deltas[n-2]
+    if out := isDup(a, b); out != nil {
+        deltas[n-2] = *out
+        return deltas[:n-1]
+    }
+    return deltas
+}
+
+// If a & b represent the same event, returns the delta that ought to be kept.
+// Otherwise, returns nil.
+// TODO: is there anything other than deletions that need deduping?
+func isDup(a, b *Delta) *Delta {
+    if out := isDeletionDup(a, b); out != nil {
+        return out
+    }
+    // TODO: Detect other duplicate situations? Are there any?
+    return nil
+}
+
+// keep the one with the most information if both are deletions.
+func isDeletionDup(a, b *Delta) *Delta {
+    if b.Type != Deleted || a.Type != Deleted {
+        return nil
+    }
+    // Do more sophisticated checks, or is this sufficient?
+    if _, ok := b.Object.(DeletedFinalStateUnknown); ok {
+        return a
+    }
+    return b
+}
 ```
 ```go
 func (f *FIFO) Pop(process PopProcessFunc) (interface{}, error) {
