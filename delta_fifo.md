@@ -330,7 +330,60 @@ func (f *DeltaFIFO) Replace(list []interface{}, _ string) error {
 }
 ```
 ```go
-Add、Pop
+// Add 添加一个Added类型的obj
+func (f *DeltaFIFO) Add(obj interface{}) error {
+    f.lock.Lock()
+    defer f.lock.Unlock()
+    f.populated = true
+    return f.queueActionLocked(Added, obj)
+}
+```
+```go
+// Pop按added/updated顺序返回一个Deltas，如果队列为空则阻塞
+func (f *DeltaFIFO) Pop(process PopProcessFunc) (interface{}, error) {
+	f.lock.Lock()
+	defer f.lock.Unlock()
+	for {
+		for len(f.queue) == 0 {
+			// 当队列为空时，除了入队以外，也可以调用Close()退出循环
+			if f.closed {
+				return nil, ErrFIFOClosed
+			}
+
+			f.cond.Wait()
+		}
+		// 取队头元素，先入先出
+		id := f.queue[0]
+		f.queue = f.queue[1:]
+		depth := len(f.queue)
+		if f.initialPopulationCount > 0 {
+			f.initialPopulationCount--
+		}
+		item, ok := f.items[id]
+		if !ok {
+			// 不应该不存在f.items中
+			klog.Errorf("Inconceivable! %q was in f.queue but not f.items; ignoring.", id)
+			continue
+		}
+		delete(f.items, id)
+		// 当队列深度大于10的时候，打开trace日志
+		if depth > 10 {
+			trace := utiltrace.New("DeltaFIFO Pop Process",
+				utiltrace.Field{Key: "ID", Value: id},
+				utiltrace.Field{Key: "Depth", Value: depth},
+				utiltrace.Field{Key: "Reason", Value: "slow event handlers blocking the queue"})
+			defer trace.LogIfLong(100 * time.Millisecond)
+		}
+		// 调用PopProcessFunc函数处理item，返回ErrRequeue时，重入队
+		err := process(item)
+		if e, ok := err.(ErrRequeue); ok {
+			f.addIfNotPresent(id, item)
+			err = e.Err
+		}
+		// 直接返回item，不进行深拷贝，将item的所有权转移给调用者
+		return item, err
+	}
+}
 ```
 ## 4.总结
-kubernetes fifo在实现先入先出队列上，值得我们学习借鉴
+kubernetes delta_fifo在实现先入先出队列思路上与kubernetes fifo类似，但其支持与key相关联事件入队，保存多个事件，是informer机制的基础
